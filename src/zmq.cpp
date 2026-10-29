@@ -1794,6 +1794,24 @@ int zmq_has (const char *capability_)
     if (strcmp (capability_, "draft") == 0)
         return true;
 #endif
+#if defined(ZMQ_HAVE_RISE_PGM)
+    //  RISE profile marker: this library carries the RISE PGM/UDP profile
+    //  (relaxed NAK schedule, repair-rate cap, loopback option, group
+    //  isolation, bounded UDP framing), so applications can detect a
+    //  stock libzmq.
+    if (strcmp (capability_, "rise_pgm") == 0)
+        return true;
+    //  Multicast engine init failures are reported through the socket
+    //  monitor (ZMQ_EVENT_CONNECT_RETRIED) and retried instead of aborting
+    //  the process.
+    if (strcmp (capability_, "rise_multicast_retry") == 0)
+        return true;
+    //  ZMQ_RISE_PGM_REPAIR_PORT / ZMQ_RISE_PGM_PROFILE are understood: a
+    //  sender can bind its receive socket to a separate unicast repair
+    //  port so NAKs are never hashed onto a co-located receiver socket.
+    if (strcmp (capability_, "rise_pgm_repair") == 0)
+        return true;
+#endif
 #if defined(ZMQ_HAVE_WS)
     if (strcmp (capability_, "WS") == 0)
         return true;

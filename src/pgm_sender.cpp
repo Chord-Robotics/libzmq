@@ -77,6 +77,15 @@ void zmq::pgm_sender_t::plug (io_thread_t *io_thread_, session_base_t *session_)
 
     //  Set POLLOUT for downlink_socket_handle.
     set_pollout (handle);
+
+    //  RISE PGM profile: with a separate repair port this sender's receive
+    //  socket only ever sees unicast NAK/SPMR, so nothing would call
+    //  in_event() and OpenPGM's own timers (ambient and post-send SPMs,
+    //  deferred repairs) would never be serviced on a quiet channel. Poll
+    //  OpenPGM once now: process_upstream() is non-blocking and reports
+    //  TIMER_PENDING, which arms the rx timer that keeps servicing them.
+    if (options.rise_pgm_repair_port != 0)
+        in_event ();
 }
 
 void zmq::pgm_sender_t::unplug ()
@@ -176,6 +185,12 @@ void zmq::pgm_sender_t::out_event ()
         //  If there are no data to write stop polling for output.
         if (bytes == 0) {
             reset_pollout (handle);
+            //  RISE PGM profile: the data just sent moved OpenPGM's next
+            //  SPM deadline (post-send heartbeat schedule); re-read it so
+            //  the rx timer fires for it instead of the old ambient one.
+            //  Done once per drained burst, not per fragment.
+            if (options.rise_pgm_repair_port != 0)
+                in_event ();
             return;
         }
 

@@ -244,6 +244,11 @@ struct options_t
     //  Loop sent multicast packets to local sockets
     bool multicast_loop;
 
+    //  RISE PGM profile: unicast repair port (0 = data port) and timer
+    //  profile (0 = legacy RISE (v1), 1 = mesh). See pgm_socket.cpp.
+    int rise_pgm_repair_port;
+    int rise_pgm_profile;
+
     //  Maximal batching size for engines with receiving functionality.
     //  So, if there are 10 messages that fit into the batch size, all of
     //  them may be read by a single 'recv' system call, thus avoiding

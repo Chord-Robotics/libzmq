@@ -218,6 +218,8 @@ zmq::options_t::options_t () :
     zap_enforce_domain (false),
     loopback_fastpath (false),
     multicast_loop (true),
+    rise_pgm_repair_port (0),
+    rise_pgm_profile (0),
     in_batch_size (8192),
     out_batch_size (8192),
     zero_copy (true),
@@ -427,6 +429,20 @@ int zmq::options_t::setsockopt (int option_,
         case ZMQ_MULTICAST_MAXTPDU:
             if (is_int && value > 0) {
                 multicast_maxtpdu = value;
+                return 0;
+            }
+            break;
+
+        case ZMQ_RISE_PGM_REPAIR_PORT:
+            if (is_int && value >= 0 && value <= 65535) {
+                rise_pgm_repair_port = value;
+                return 0;
+            }
+            break;
+
+        case ZMQ_RISE_PGM_PROFILE:
+            if (is_int && (value == 0 || value == 1)) {
+                rise_pgm_profile = value;
                 return 0;
             }
             break;
@@ -1080,6 +1096,20 @@ int zmq::options_t::getsockopt (int option_,
         case ZMQ_MULTICAST_MAXTPDU:
             if (is_int) {
                 *value = multicast_maxtpdu;
+                return 0;
+            }
+            break;
+
+        case ZMQ_RISE_PGM_REPAIR_PORT:
+            if (is_int) {
+                *value = rise_pgm_repair_port;
+                return 0;
+            }
+            break;
+
+        case ZMQ_RISE_PGM_PROFILE:
+            if (is_int) {
+                *value = rise_pgm_profile;
                 return 0;
             }
             break;

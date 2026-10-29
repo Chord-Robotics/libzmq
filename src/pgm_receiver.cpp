@@ -157,7 +157,8 @@ void zmq::pgm_receiver_t::in_event ()
         //  Note the workaround made not to break strict-aliasing rules.
         insize = 0;
         void *tmp = NULL;
-        ssize_t received = pgm_socket.receive (&tmp, &tsi);
+        uint32_t sequence = 0;
+        ssize_t received = pgm_socket.receive (&tmp, &tsi, &sequence);
 
         //  No data to process. This may happen if the packet received is
         //  neither ODATA nor ODATA.
@@ -186,18 +187,38 @@ void zmq::pgm_receiver_t::in_event ()
 
         //  New peer. Add it to the list of know but unjoint peers.
         if (it == peers.end ()) {
-            peer_info_t peer_info = {false, NULL};
+            peer_info_t peer_info = {false, NULL, false, 0};
             it = peers.ZMQ_MAP_INSERT_OR_EMPLACE (*tsi, peer_info).first;
         }
+
+        // A delivery gap invalidates a partially decoded ZMTP message,
+        // even if OpenPGM reports RESET only after returning this batch.
+        if (it->second.has_sequence
+            && sequence != uint32_t (it->second.last_sequence + 1)) {
+            it->second.joined = false;
+            LIBZMQ_DELETE (it->second.decoder);
+        }
+        it->second.last_sequence = sequence;
+        it->second.has_sequence = true;
 
         insize = static_cast<size_t> (received);
         inpos = (unsigned char *) tmp;
 
         //  Read the offset of the fist message in the current packet.
-        zmq_assert (insize >= sizeof (uint16_t));
+        if (insize < sizeof (uint16_t)) {
+            it->second.joined = false;
+            LIBZMQ_DELETE (it->second.decoder);
+            continue;
+        }
         uint16_t offset = get_uint16 (inpos);
         inpos += sizeof (uint16_t);
         insize -= sizeof (uint16_t);
+
+        if (offset != 0xffff && offset > insize) {
+            it->second.joined = false;
+            LIBZMQ_DELETE (it->second.decoder);
+            continue;
+        }
 
         //  Join the stream if needed.
         if (!it->second.joined) {

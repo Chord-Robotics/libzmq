@@ -55,7 +55,7 @@ class pgm_socket_t
     size_t get_max_tsdu_size ();
 
     //  Receive data from pgm socket.
-    ssize_t receive (void **data_, const pgm_tsi_t **tsi_);
+    ssize_t receive (void **data_, const pgm_tsi_t **tsi_, uint32_t *sequence_);
 
     long get_rx_timeout ();
     long get_tx_timeout ();
@@ -82,6 +82,8 @@ class pgm_socket_t
     //  Array of pgm_msgv_t structures to store received data
     //  from the socket (pgm_transport_recvmsgv).
     pgm_msgv_t *pgm_msgv;
+    //  RISE fix: TSI of the last data-loss report, owned by the socket.
+    pgm_tsi_t reset_tsi;
 
     //  Size of pgm_msgv array.
     size_t pgm_msgv_len;

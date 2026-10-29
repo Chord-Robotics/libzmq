@@ -174,6 +174,14 @@ void zmq::udp_engine_t::plug (io_thread_t *io_thread_, session_base_t *session_)
 
         if (multicast) {
             rc = rc | add_membership (_fd, udp_addr);
+#if defined ZMQ_HAVE_LINUX && defined IP_MULTICAST_ALL
+            //  RISE profile: only deliver the joined group to this socket,
+            //  not every group bound to the same port.
+            const int mc_all = 0;
+            rc = rc
+                 | setsockopt (_fd, IPPROTO_IP, IP_MULTICAST_ALL, &mc_all,
+                               sizeof (mc_all));
+#endif
         }
     }
 
@@ -423,6 +431,21 @@ void zmq::udp_engine_t::out_event ()
         const size_t body_size = body_msg.size ();
         size_t size;
 
+        //  RISE profile: never copy more than the datagram buffer holds.
+        //  Oversize messages are dropped here instead of overrunning
+        //  _out_buffer (upstream left this as a TODO).
+        const bool oversize =
+          _options.raw_socket
+            ? body_size > MAX_UDP_MSG
+            : (group_size > 255 || 1 + group_size + body_size > MAX_UDP_MSG);
+        if (oversize) {
+            rc = group_msg.close ();
+            errno_assert (rc == 0);
+            rc = body_msg.close ();
+            errno_assert (rc == 0);
+            return;
+        }
+
         if (_options.raw_socket) {
             rc = resolve_raw_address (static_cast<char *> (group_msg.data ()),
                                       group_size);
@@ -444,7 +467,6 @@ void zmq::udp_engine_t::out_event ()
         } else {
             size = group_size + body_size + 1;
 
-            // TODO: check if larger than maximum size
             _out_buffer[0] = static_cast<unsigned char> (group_size);
             memcpy (_out_buffer + 1, group_msg.data (), group_size);
             memcpy (_out_buffer + 1 + group_size, body_msg.data (), body_size);
@@ -540,17 +562,23 @@ void zmq::udp_engine_t::in_event ()
     } else {
         // TODO in out_event, the group size is an *unsigned* char. what is
         // the maximum value?
+        //  RISE profile: validate the frame before allocating or copying.
+        //  An empty datagram or a group length past the received bytes is
+        //  dropped (upstream copied first and leaked the message).
+        if (nbytes < 1)
+            return;
+
         const char *group_buffer = _in_buffer + 1;
-        const int group_size = _in_buffer[0];
+        const int group_size = static_cast<unsigned char> (_in_buffer[0]);
+
+        //  This doesn't fit, just ignore
+        if (nbytes - 1 < group_size)
+            return;
 
         rc = msg.init_size (group_size);
         errno_assert (rc == 0);
         msg.set_flags (msg_t::more);
         memcpy (msg.data (), group_buffer, group_size);
-
-        //  This doesn't fit, just ignore
-        if (nbytes - 1 < group_size)
-            return;
 
         body_size = nbytes - 1 - group_size;
         body_offset = 1 + group_size;

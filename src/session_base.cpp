@@ -3,6 +3,7 @@
 #include "precompiled.hpp"
 #include "macros.hpp"
 #include "session_base.hpp"
+#include "endpoint.hpp"
 #include "i_engine.hpp"
 #include "err.hpp"
 #include "pipe.hpp"
@@ -101,6 +102,7 @@ zmq::session_base_t::session_base_t (class io_thread_t *io_thread_,
     _socket (socket_),
     _io_thread (io_thread_),
     _has_linger_timer (false),
+    _has_multicast_retry_timer (false),
     _addr (addr_)
 #ifdef ZMQ_HAVE_WSS
     ,
@@ -123,6 +125,10 @@ zmq::session_base_t::~session_base_t ()
     if (_has_linger_timer) {
         cancel_timer (linger_timer_id);
         _has_linger_timer = false;
+    }
+    if (_has_multicast_retry_timer) {
+        cancel_timer (multicast_retry_timer_id);
+        _has_multicast_retry_timer = false;
     }
 
     //  Close the engine.
@@ -484,6 +490,13 @@ void zmq::session_base_t::process_term (int linger_)
 {
     zmq_assert (!_pending);
 
+    //  RISE profile: a pending multicast retry must not fire on a
+    //  terminating session.
+    if (_has_multicast_retry_timer) {
+        cancel_timer (multicast_retry_timer_id);
+        _has_multicast_retry_timer = false;
+    }
+
     //  If the termination of the pipe happens before the term command is
     //  delivered there's nothing much to do. We can proceed with the
     //  standard termination immediately.
@@ -521,6 +534,14 @@ void zmq::session_base_t::process_term (int linger_)
 
 void zmq::session_base_t::timer_event (int id_)
 {
+    //  RISE profile: retry a multicast engine whose init failed earlier.
+    if (id_ == multicast_retry_timer_id) {
+        _has_multicast_retry_timer = false;
+        if (!is_terminating () && !_pending)
+            start_connecting (false);
+        return;
+    }
+
     //  Linger period expired. We can proceed with termination even though
     //  there are still pending messages to be sent.
     zmq_assert (id_ == linger_timer_id);
@@ -529,6 +550,24 @@ void zmq::session_base_t::timer_event (int id_)
     //  Ask pipe to terminate even though there may be pending messages in it.
     zmq_assert (_pipe);
     _pipe->terminate (false);
+}
+
+void zmq::session_base_t::retry_multicast_engine ()
+{
+    //  Environmental failure (interface or address gone, OpenPGM refused
+    //  the socket): report it like a failed connect attempt and try again
+    //  after the reconnect interval. With reconnect disabled the socket
+    //  owner sees the event and recreates the endpoint itself. This
+    //  replaces upstream's errno_assert, which aborted the host process.
+    std::string endpoint;
+    _addr->to_string (endpoint);
+    const int interval = options.reconnect_ivl > 0 ? options.reconnect_ivl : 0;
+    _socket->event_connect_retried (
+      make_unconnected_connect_endpoint_pair (endpoint), interval);
+    if (options.reconnect_ivl > 0 && !_has_multicast_retry_timer) {
+        add_timer (options.reconnect_ivl, multicast_retry_timer_id);
+        _has_multicast_retry_timer = true;
+    }
 }
 
 void zmq::session_base_t::process_conn_failed ()
@@ -669,7 +708,12 @@ void zmq::session_base_t::start_connecting (bool wait_)
         }
 
         int rc = engine->init (_addr, send, recv);
-        errno_assert (rc == 0);
+        if (rc != 0) {
+            //  RISE profile: recoverable, see retry_multicast_engine.
+            delete engine;
+            retry_multicast_engine ();
+            return;
+        }
 
         send_attach (this, engine);
 
@@ -697,7 +741,12 @@ void zmq::session_base_t::start_connecting (bool wait_)
 
             int rc =
               pgm_sender->init (udp_encapsulation, _addr->address.c_str ());
-            errno_assert (rc == 0);
+            if (rc != 0) {
+                //  RISE profile: recoverable, see retry_multicast_engine.
+                delete pgm_sender;
+                retry_multicast_engine ();
+                return;
+            }
 
             send_attach (this, pgm_sender);
         } else {
@@ -708,7 +757,12 @@ void zmq::session_base_t::start_connecting (bool wait_)
 
             int rc =
               pgm_receiver->init (udp_encapsulation, _addr->address.c_str ());
-            errno_assert (rc == 0);
+            if (rc != 0) {
+                //  RISE profile: recoverable, see retry_multicast_engine.
+                delete pgm_receiver;
+                retry_multicast_engine ();
+                return;
+            }
 
             send_attach (this, pgm_receiver);
         }

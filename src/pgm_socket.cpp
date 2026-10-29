@@ -110,6 +110,16 @@ int zmq::pgm_socket_t::init (bool udp_encapsulation_, const char *network_)
 
     zmq_assert (res != NULL);
 
+    //  RISE PGM profile: a separate unicast repair port only exists for
+    //  UDP encapsulation (epgm://), and it must differ from the data port,
+    //  otherwise the option would silently recreate the shared-port defect
+    //  it is meant to remove.
+    if (options.rise_pgm_repair_port != 0
+        && (!udp_encapsulation_
+            || options.rise_pgm_repair_port == (int) port_number)) {
+        goto err_abort;
+    }
+
     //  Pick up detected IP family.
     sa_family = res->ai_send_addrs[0].gsr_group.ss_family;
 
@@ -134,11 +144,25 @@ int zmq::pgm_socket_t::init (bool udp_encapsulation_, const char *network_)
 
         //  All options are of data type int
         const int encapsulation_port = port_number;
+        //  RISE PGM profile: optional separate unicast repair port.
+        //  OpenPGM binds every PGM socket's receive socket to the multicast
+        //  encapsulation port with SO_REUSEPORT, so a sender and a receiver
+        //  on the same channel in one process share a kernel reuseport
+        //  group and unicast NAK/SPMR datagrams are hashed between them;
+        //  the recv-only socket discards them and repairs never happen.
+        //  With a repair port the sender's receive socket is bound to that
+        //  port alone (the data port is restored before the group options
+        //  copy it) and receivers address NAK/SPMR there. All peers must
+        //  agree on the value; 0 keeps the legacy single-port behaviour.
+        const int repair_port = options.rise_pgm_repair_port;
+        const int ucast_port = repair_port ? repair_port : encapsulation_port;
+        const int bind_mcast_port =
+          (!receiver && repair_port) ? repair_port : encapsulation_port;
         if (!pgm_setsockopt (sock, IPPROTO_PGM, PGM_UDP_ENCAP_UCAST_PORT,
-                             &encapsulation_port, sizeof (encapsulation_port)))
+                             &ucast_port, sizeof (ucast_port)))
             goto err_abort;
         if (!pgm_setsockopt (sock, IPPROTO_PGM, PGM_UDP_ENCAP_MCAST_PORT,
-                             &encapsulation_port, sizeof (encapsulation_port)))
+                             &bind_mcast_port, sizeof (bind_mcast_port)))
             goto err_abort;
     } else {
         if (!pgm_socket (&sock, sa_family, SOCK_SEQPACKET, IPPROTO_PGM,
@@ -181,12 +205,26 @@ int zmq::pgm_socket_t::init (bool udp_encapsulation_, const char *network_)
     }
 
     if (receiver) {
+        //  RISE PGM profile 0: relaxed NAK schedule (legacy RISE values),
+        //  tuned for single-packet messages. Profile 1 (mesh)
+        //  keeps the 2 s NAK back-off: OpenPGM declares a hole lost, with
+        //  no NAK, when the back-off expires before the source's address
+        //  (NLA) is known, and the back-off is a uniform random draw up to
+        //  this value, so a shorter one raises the loss probability for
+        //  the first message from a newly seen source. Profile 1 shortens
+        //  the NAK repeat and allows 20 repair attempts per sequence, each
+        //  waiting 800 ms for RDATA after an NCF, so a multi-packet message
+        //  can be repaired at the profile's repair rate instead of being
+        //  discarded after three attempts.
+        const bool mesh = options.rise_pgm_profile == 1;
         const int recv_only = 1, rxw_max_tpdu = (int) options.multicast_maxtpdu,
                   rxw_sqns = compute_sqns (rxw_max_tpdu),
                   peer_expiry = pgm_secs (300), spmr_expiry = pgm_msecs (25),
-                  nak_bo_ivl = pgm_msecs (50), nak_rpt_ivl = pgm_msecs (200),
-                  nak_rdata_ivl = pgm_msecs (200), nak_data_retries = 50,
-                  nak_ncf_retries = 50;
+                  nak_bo_ivl = pgm_secs (2),
+                  nak_rpt_ivl = mesh ? pgm_msecs (500) : pgm_secs (10),
+                  nak_rdata_ivl = pgm_msecs (800),
+                  nak_data_retries = mesh ? 20 : 3,
+                  nak_ncf_retries = mesh ? 20 : 3;
 
         if (!pgm_setsockopt (sock, IPPROTO_PGM, PGM_RECV_ONLY, &recv_only,
                              sizeof (recv_only))
@@ -208,25 +246,54 @@ int zmq::pgm_socket_t::init (bool udp_encapsulation_, const char *network_)
                                 &nak_ncf_retries, sizeof (nak_ncf_retries)))
             goto err_abort;
     } else {
+        const bool mesh = options.rise_pgm_profile == 1;
         const int send_only = 1, max_rte = (int) ((options.rate * 1000) / 8),
+                  //  RISE PGM profile 0: cap repair (RDATA) traffic at the
+                  //  legacy 1500 B/s (one packet per second) and send only
+                  //  the 30 s heartbeat SPM. Profile 1 (mesh): repairs at
+                  //  12500 B/s (about nine packets per second) and a short
+                  //  post-send SPM schedule, so the loss of a message's
+                  //  trailing packet is typically detected by one of the
+                  //  post-send SPMs (+200 ms, +400 ms) or the 2 s ambient one (a
+                  //  lost SPM delays it) instead of at a 30 s ambient SPM.
+                  max_repair_rte = mesh ? 12500 : 1500,
                   txw_max_tpdu = (int) options.multicast_maxtpdu,
                   txw_sqns = compute_sqns (txw_max_tpdu),
-                  ambient_spm = pgm_secs (30),
-                  heartbeat_spm[] = {
-                    pgm_msecs (100), pgm_msecs (100),  pgm_msecs (100),
-                    pgm_msecs (100), pgm_msecs (1300), pgm_secs (7),
-                    pgm_secs (16),   pgm_secs (25),    pgm_secs (30)};
+                  //  Ambient SPM: profile 1 announces every 2 s on an idle
+                  //  channel so a receiver that joins after this sender
+                  //  learns the sender's address (NLA) before its first
+                  //  message. OpenPGM declares a hole lost, without a NAK,
+                  //  when the NAK back-off expires before the NLA is known
+                  //  (receiver.c nak_rb_state), which can happen for holes in
+                  //  the first message from a source. This shortens the
+                  //  exposure; it does not remove it.
+                  ambient_spm = mesh ? pgm_secs (2) : pgm_secs (30),
+                  legacy_heartbeat_spm[] = {pgm_secs (30)},
+                  //  Post-send schedule. OpenPGM (timer.c) uses the first
+                  //  interval twice (reset, then re-added on the first fire)
+                  //  and the last one only terminates the series, so this
+                  //  array announces at +200 ms and +400 ms after the last
+                  //  data; the ambient cadence continues afterwards. The
+                  //  upstream 100 ms x4 series competes with data on
+                  //  bandwidth-limited links.
+                  mesh_heartbeat_spm[] = {pgm_msecs (200), pgm_secs (1),
+                                          pgm_secs (30)};
+        const int *heartbeat_spm = mesh ? mesh_heartbeat_spm : legacy_heartbeat_spm;
+        const socklen_t heartbeat_len =
+          mesh ? sizeof (mesh_heartbeat_spm) : sizeof (legacy_heartbeat_spm);
 
         if (!pgm_setsockopt (sock, IPPROTO_PGM, PGM_SEND_ONLY, &send_only,
                              sizeof (send_only))
             || !pgm_setsockopt (sock, IPPROTO_PGM, PGM_ODATA_MAX_RTE, &max_rte,
                                 sizeof (max_rte))
+            || !pgm_setsockopt (sock, IPPROTO_PGM, PGM_RDATA_MAX_RTE,
+                                &max_repair_rte, sizeof (max_repair_rte))
             || !pgm_setsockopt (sock, IPPROTO_PGM, PGM_TXW_SQNS, &txw_sqns,
                                 sizeof (txw_sqns))
             || !pgm_setsockopt (sock, IPPROTO_PGM, PGM_AMBIENT_SPM,
                                 &ambient_spm, sizeof (ambient_spm))
             || !pgm_setsockopt (sock, IPPROTO_PGM, PGM_HEARTBEAT_SPM,
-                                &heartbeat_spm, sizeof (heartbeat_spm)))
+                                heartbeat_spm, heartbeat_len))
             goto err_abort;
     }
 
@@ -272,6 +339,16 @@ int zmq::pgm_socket_t::init (bool udp_encapsulation_, const char *network_)
         zmq_assert (false);
     }
 
+    //  RISE PGM profile: the sender's receive socket is bound to the
+    //  repair port; restore the data port before PGM_JOIN_GROUP and
+    //  PGM_SEND_GROUP copy it into the group addresses.
+    if (udp_encapsulation_ && !receiver && options.rise_pgm_repair_port) {
+        const int data_port = port_number;
+        if (!pgm_setsockopt (sock, IPPROTO_PGM, PGM_UDP_ENCAP_MCAST_PORT,
+                             &data_port, sizeof (data_port)))
+            goto err_abort;
+    }
+
     //  Join IP multicast groups.
     for (unsigned i = 0; i < res->ai_recv_addrs_len; i++) {
         if (!pgm_setsockopt (sock, IPPROTO_PGM, PGM_JOIN_GROUP,
@@ -287,8 +364,9 @@ int zmq::pgm_socket_t::init (bool udp_encapsulation_, const char *network_)
 
     //  Set IP level parameters.
     {
-        // Multicast loopback disabled by default
-        const int multicast_loop = 0;
+        //  RISE PGM profile: multicast loopback follows ZMQ_MULTICAST_LOOP
+        //  (needed for several endpoints on one host) instead of always 0.
+        const int multicast_loop = options.multicast_loop ? 1 : 0;
         if (!pgm_setsockopt (sock, IPPROTO_PGM, PGM_MULTICAST_LOOP,
                              &multicast_loop, sizeof (multicast_loop)))
             goto err_abort;
@@ -320,15 +398,42 @@ int zmq::pgm_socket_t::init (bool udp_encapsulation_, const char *network_)
     //  For receiver transport preallocate pgm_msgv array.
     if (receiver) {
         zmq_assert (options.in_batch_size > 0);
-        size_t max_tsdu_size = get_max_tsdu_size ();
-        pgm_msgv_len = (int) options.in_batch_size / max_tsdu_size;
-        if ((int) options.in_batch_size % max_tsdu_size)
-            pgm_msgv_len++;
-        zmq_assert (pgm_msgv_len);
+        //  RISE PGM profile: one APDU per pgm_recvmsgv call. Upstream sizes
+        //  the vector from ZMQ_IN_BATCH_SIZE (six entries at 8192 B). With
+        //  more than one entry OpenPGM 5.3.128 can flush the same peer twice
+        //  inside one call; if the first flush delivered data and the second
+        //  meets a hole, pgm_flush_peers_pending zeroes peer->last_commit
+        //  with packets still committed, pgm_rxw_remove_commit never runs
+        //  again, the trail is pinned and, once the hole is declared lost,
+        //  every new packet is dropped on the BOUNDS branch (only the
+        //  aggregate PACKETS_DISCARDED counter moves, no NAK). One entry
+        //  returns after each delivered APDU, so the next call removes the
+        //  commit before reading. Cost: more pgm_recvmsgv calls per burst.
+        pgm_msgv_len = 1;
 
         pgm_msgv = (pgm_msgv_t *) malloc (sizeof (pgm_msgv_t) * pgm_msgv_len);
         alloc_assert (pgm_msgv);
     }
+
+#if defined ZMQ_HAVE_LINUX && defined IP_MULTICAST_ALL
+    //  RISE PGM profile: only deliver datagrams of the joined group(s) to
+    //  this receive socket. Linux otherwise delivers every group bound to
+    //  the same port. Done after connect,
+    //  when OpenPGM exposes the receive socket. Failure is fatal because
+    //  zmq_has ("rise_pgm") promises group isolation.
+    if (receiver) {
+        int recv_fd = -1;
+        socklen_t recv_fd_len = sizeof (recv_fd);
+        const int mc_all = 0;
+        if (!pgm_getsockopt (sock, IPPROTO_PGM, PGM_RECV_SOCK, &recv_fd,
+                             &recv_fd_len)
+            || recv_fd < 0
+            || setsockopt (recv_fd, IPPROTO_IP, IP_MULTICAST_ALL, &mc_all,
+                           sizeof (mc_all))
+                 != 0)
+            goto err_abort;
+    }
+#endif
 
     return 0;
 
@@ -501,7 +606,7 @@ size_t zmq::pgm_socket_t::get_max_tsdu_size ()
 
 //  pgm_recvmsgv is called to fill the pgm_msgv array up to  pgm_msgv_len.
 //  In subsequent calls data from pgm_msgv structure are returned.
-ssize_t zmq::pgm_socket_t::receive (void **raw_data_, const pgm_tsi_t **tsi_)
+ssize_t zmq::pgm_socket_t::receive (void **raw_data_, const pgm_tsi_t **tsi_, uint32_t *sequence_)
 {
     size_t raw_data_len = 0;
 
@@ -572,8 +677,13 @@ ssize_t zmq::pgm_socket_t::receive (void **raw_data_, const pgm_tsi_t **tsi_)
         if (status == PGM_IO_STATUS_RESET) {
             struct pgm_sk_buff_t *skb = pgm_msgv[0].msgv_skb[0];
 
-            //  Save lost data TSI.
-            *tsi_ = &skb->tsi;
+            //  Save lost data TSI. RISE fix: copy it, because the skb is
+            //  freed below and upstream returned a pointer into it. A
+            //  receiver reading the freed TSI could look up the wrong
+            //  peer, leave the real peer's decoder joined across the gap
+            //  and then parse payload bytes as frame headers.
+            reset_tsi = skb->tsi;
+            *tsi_ = &reset_tsi;
             nbytes_rec = 0;
 
             //  In case of dala loss -1 is returned.
@@ -596,6 +706,7 @@ ssize_t zmq::pgm_socket_t::receive (void **raw_data_, const pgm_tsi_t **tsi_)
     struct pgm_sk_buff_t *skb = pgm_msgv[pgm_msgv_processed].msgv_skb[0];
 
     //  Take pointers from pgm_msgv_t structure.
+    *sequence_ = skb->sequence;
     *raw_data_ = skb->data;
     raw_data_len = skb->len;
 

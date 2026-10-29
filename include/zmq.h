@@ -663,6 +663,12 @@ ZMQ_EXPORT void zmq_threadclose (void *thread_);
 #define ZMQ_NORM_NUM_AUTOPARITY 123
 #define ZMQ_NORM_PUSH 124
 
+/*  RISE PGM profile options                                                */
+/*  Separate unicast repair port for NAK/SPMR (0 = legacy: data port).      */
+#define ZMQ_RISE_PGM_REPAIR_PORT 2001
+/*  Recovery timer profile: 0 = legacy RISE (v1) values, 1 = mesh.           */
+#define ZMQ_RISE_PGM_PROFILE 2002
+
 /*  DRAFT ZMQ_NORM_MODE options                                               */
 #define ZMQ_NORM_FIXED 0
 #define ZMQ_NORM_CC 1

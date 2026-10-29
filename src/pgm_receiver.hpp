@@ -70,6 +70,8 @@ class pgm_receiver_t ZMQ_FINAL : public io_object_t, public i_engine
     {
         bool joined;
         v1_decoder_t *decoder;
+        bool has_sequence;
+        uint32_t last_sequence;
     };
 
     struct tsi_comp

@@ -1186,6 +1186,8 @@ set(readme-docs AUTHORS LICENSE NEWS)
 if(WITH_OPENPGM)
   message(STATUS "Building with OpenPGM")
   set(ZMQ_HAVE_OPENPGM 1)
+  # RISE profile marker, reported by zmq_has("rise_pgm").
+  set(ZMQ_HAVE_RISE_PGM 1)
   include_directories(${OPENPGM_INCLUDE_DIRS})
   link_directories(${OPENPGM_LIBRARY_DIRS})
   set(OPTIONAL_LIBRARIES ${OPENPGM_LIBRARIES})

@@ -129,11 +129,21 @@ class session_base_t : public own_t, public io_object_t, public i_pipe_events
     //  ID of the linger timer
     enum
     {
-        linger_timer_id = 0x20
+        linger_timer_id = 0x20,
+        //  RISE profile: retry timer for a multicast (PGM/UDP) engine whose
+        //  initialisation failed for an environmental reason.
+        multicast_retry_timer_id = 0x21
     };
 
     //  True is linger timer is running.
     bool _has_linger_timer;
+
+    //  RISE profile: true while multicast_retry_timer_id is pending.
+    bool _has_multicast_retry_timer;
+
+    //  RISE profile: report a failed multicast engine initialisation on the
+    //  socket monitor and schedule a bounded retry instead of aborting.
+    void retry_multicast_engine ();
 
     //  Protocol and address to use when connecting.
     address_t *_addr;

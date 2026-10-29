@@ -69,6 +69,7 @@
 #cmakedefine ZMQ_HAVE_TIPC
 
 #cmakedefine ZMQ_HAVE_OPENPGM
+#cmakedefine ZMQ_HAVE_RISE_PGM
 #cmakedefine ZMQ_HAVE_NORM
 #cmakedefine ZMQ_HAVE_VMCI
 
